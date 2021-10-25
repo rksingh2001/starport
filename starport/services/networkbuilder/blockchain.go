@@ -11,16 +11,13 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/cosmos/cosmos-sdk/types"
-	"github.com/tendermint/starport/starport/chainconfig"
+	launchtypes "github.com/tendermint/spn/x/launch/types"
+	profiletypes "github.com/tendermint/spn/x/profile/types"
 	sperrors "github.com/tendermint/starport/starport/errors"
 	"github.com/tendermint/starport/starport/pkg/chaincmd"
 	"github.com/tendermint/starport/starport/pkg/cosmosver"
 	"github.com/tendermint/starport/starport/pkg/events"
 	"github.com/tendermint/starport/starport/pkg/gitpod"
-	"github.com/tendermint/starport/starport/pkg/jsondoc"
-	"github.com/tendermint/starport/starport/pkg/spn"
-	"github.com/tendermint/starport/starport/pkg/xchisel"
 	"github.com/tendermint/starport/starport/pkg/xos"
 	"github.com/tendermint/starport/starport/services/chain"
 )
@@ -132,44 +129,8 @@ func (b *Blockchain) init(
 	return nil
 }
 
-func genesisPath(appHome string) string {
-	return fmt.Sprintf("%s/config/genesis.json", appHome)
-}
-
 func initialGenesisPath(appHome string) string {
 	return fmt.Sprintf("%s/config/initial_genesis.json", appHome)
-}
-
-// BlockchainInfo hold information about a Blokchain.
-type BlockchainInfo struct {
-	Genesis          jsondoc.Doc
-	Config           chainconfig.Config
-	RPCPublicAddress string
-}
-
-// Info returns information about the blockchain.
-func (b *Blockchain) Info() (BlockchainInfo, error) {
-	genesisPath, err := b.chain.GenesisPath()
-	if err != nil {
-		return BlockchainInfo{}, err
-	}
-	genesis, err := ioutil.ReadFile(genesisPath)
-	if err != nil {
-		return BlockchainInfo{}, err
-	}
-	config, err := b.chain.Config()
-	if err != nil {
-		return BlockchainInfo{}, err
-	}
-	paddr, err := b.chain.RPCPublicAddress()
-	if err != nil {
-		return BlockchainInfo{}, err
-	}
-	return BlockchainInfo{
-		Genesis:          genesis,
-		Config:           config,
-		RPCPublicAddress: paddr,
-	}, nil
 }
 
 // createOptions holds info about how to create a chain.
@@ -225,35 +186,39 @@ func (b *Blockchain) Create(ctx context.Context, options ...CreateOption) error 
 		}
 	}
 
-	account, err := b.builder.AccountInUse()
-	if err != nil {
-		return err
-	}
 	chainID, err := b.chain.ID()
 	if err != nil {
 		return err
 	}
-	return b.builder.spnclient.ChainCreate(
-		ctx,
-		account.Name,
+
+	q := profiletypes.NewQueryClient(b.builder.cosmos.Context)
+	_, err = q.CoordinatorByAddress(ctx, &profiletypes.QueryGetCoordinatorByAddressRequest{
+		Address: b.builder.account.Address(spnAddressPrefix),
+	})
+	if err != nil {
+		msgCreateCoordinator := profiletypes.NewMsgCreateCoordinator(
+			b.builder.account.Address(spnAddressPrefix),
+			"",
+			"",
+			"",
+		)
+		if _, err := b.builder.cosmos.BroadcastTx(b.builder.account.Name, msgCreateCoordinator); err != nil {
+			return err
+		}
+	}
+
+	msgCreateChain := launchtypes.NewMsgCreateChain(
+		b.builder.account.Address(spnAddressPrefix),
 		chainID,
 		b.url,
 		b.hash,
 		o.genesisURL,
 		genesisHash,
+		false,
+		0,
 	)
-}
-
-// Proposal holds proposal info of validator candidate to join to a network.
-type Proposal struct {
-	Validator chain.Validator
-	Meta      ProposalMeta
-}
-
-type ProposalMeta struct {
-	Website  string
-	Identity string
-	Details  string
+	_, err = b.builder.cosmos.BroadcastTx(b.builder.account.Name, msgCreateChain)
+	return err
 }
 
 type Account struct {
@@ -278,83 +243,6 @@ func (b *Blockchain) CreateAccount(ctx context.Context, account chain.Account) (
 		Address:  acc.Address,
 		Mnemonic: acc.Mnemonic,
 	}, nil
-}
-
-// IssueGentx creates a Genesis transaction for account with proposal.
-func (b *Blockchain) IssueGentx(ctx context.Context, account chain.Account, proposal Proposal) (gentx jsondoc.Doc, err error) {
-	commands, err := b.chain.Commands(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := commands.AddGenesisAccount(ctx, account.Address, account.Coins); err != nil {
-		return nil, err
-	}
-
-	gentxPath, err := commands.Gentx(
-		ctx,
-		account.Name,
-		proposal.Validator.StakingAmount,
-		chaincmd.GentxWithMoniker(proposal.Validator.Moniker),
-		chaincmd.GentxWithCommissionRate(proposal.Validator.CommissionRate),
-		chaincmd.GentxWithCommissionMaxRate(proposal.Validator.CommissionMaxRate),
-		chaincmd.GentxWithCommissionMaxChangeRate(proposal.Validator.CommissionMaxChangeRate),
-		chaincmd.GentxWithMinSelfDelegation(proposal.Validator.MinSelfDelegation),
-		chaincmd.GentxWithGasPrices(proposal.Validator.GasPrices),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return ioutil.ReadFile(gentxPath)
-}
-
-// Join proposes a validator to a network.
-//
-// address is the ip+port combination of a p2p address of a node (does not include id).
-// https://docs.tendermint.com/master/spec/p2p/config.html.
-func (b *Blockchain) Join(
-	ctx context.Context,
-	account *chain.Account,
-	validatorAddress,
-	publicAddress string,
-	gentx []byte,
-	selfDelegation types.Coin,
-) error {
-	commands, err := b.chain.Commands(ctx)
-	if err != nil {
-		return err
-	}
-
-	key, err := commands.ShowNodeID(ctx)
-	if err != nil {
-		return err
-	}
-
-	if xchisel.IsEnabled() {
-		publicAddress = xchisel.ServerAddr()
-	}
-
-	p2pAddress := fmt.Sprintf("%s@%s", key, publicAddress)
-
-	chainID, err := b.chain.ID()
-	if err != nil {
-		return err
-	}
-
-	var proposalOptions []spn.ProposalOption
-	if account != nil {
-		coins, err := types.ParseCoinsNormalized(account.Coins)
-		if err != nil {
-			return err
-		}
-
-		proposalOptions = append(proposalOptions, spn.AddAccountProposal(account.Address, coins))
-	}
-
-	proposalOptions = append(proposalOptions, spn.AddValidatorProposal(gentx, validatorAddress, selfDelegation, p2pAddress))
-
-	return b.builder.Propose(ctx, chainID, proposalOptions...)
 }
 
 // Cleanup closes the event bus and cleanups everything related to installed blockchain.

@@ -8,64 +8,48 @@ import (
 
 	"github.com/manifoldco/promptui"
 	"github.com/spf13/cobra"
-	"github.com/tendermint/starport/starport/pkg/cliquiz"
 	"github.com/tendermint/starport/starport/pkg/clispinner"
+	"github.com/tendermint/starport/starport/pkg/cosmosaccount"
 	"github.com/tendermint/starport/starport/pkg/events"
 	"github.com/tendermint/starport/starport/pkg/xurl"
 	"github.com/tendermint/starport/starport/services/networkbuilder"
 )
 
 const (
-	flagBranch  = "branch"
 	flagTag     = "tag"
+	flagBranch  = "branch"
+	flagHash    = "hash"
 	flagGenesis = "genesis"
 )
 
-// NewNetworkChainCreate creates a new chain create command to create
-// a new network.
-func NewNetworkChainCreate() *cobra.Command {
+// NewNetworkChainPublish returns a new command to publish a new chain to start a new network.
+func NewNetworkChainPublish() *cobra.Command {
 	c := &cobra.Command{
-		Use:   "create [chain] [source]",
-		Short: "Create a new network",
-		RunE:  networkChainCreateHandler,
+		Use:   "publish [source-url]",
+		Short: "Publush a new chain to start a new network",
+		Args:  cobra.ExactArgs(1),
+		RunE:  networkChainPublishHandler,
 	}
-	c.Flags().AddFlagSet(flagSetHome())
-	c.Flags().String(flagBranch, "", "Git branch to use")
-	c.Flags().String(flagTag, "", "Git tag to use")
+
+	c.Flags().String(flagBranch, "", "Git branch to use for the repo")
+	c.Flags().String(flagTag, "", "Git tag to use for the repo")
+	c.Flags().String(flagHash, "", "Git hash to use for the repo")
 	c.Flags().String(flagGenesis, "", "URL to a custom Genesis")
+	c.Flags().String(flagFrom, cosmosaccount.DefaultAccount, "Account name to use for sending transactions to SPN")
+	c.Flags().AddFlagSet(flagSetKeyringBackend())
+	c.Flags().AddFlagSet(flagSetHome())
+
 	return c
 }
 
-func networkChainCreateHandler(cmd *cobra.Command, args []string) error {
-	// collect required values.
+func networkChainPublishHandler(cmd *cobra.Command, args []string) error {
 	var (
-		chainID       string
-		source        string
-		branch, _     = cmd.Flags().GetString(flagBranch)
+		source        = args[0]
 		tag, _        = cmd.Flags().GetString(flagTag)
+		branch, _     = cmd.Flags().GetString(flagBranch)
+		hash, _       = cmd.Flags().GetString(flagHash)
 		genesisURL, _ = cmd.Flags().GetString(flagGenesis)
 	)
-
-	if len(args) >= 1 {
-		chainID = args[0]
-	}
-
-	if len(args) >= 2 {
-		source = args[1]
-	}
-
-	var questions []cliquiz.Question
-	if chainID == "" {
-		questions = append(questions, cliquiz.NewQuestion("Chain ID", &chainID, cliquiz.Required()))
-	}
-	if source == "" {
-		questions = append(questions, cliquiz.NewQuestion("Git repository of the chain's source code (local or remote)", &source, cliquiz.Required()))
-	}
-	if len(questions) > 0 {
-		if err := cliquiz.Ask(questions...); err != nil {
-			return err
-		}
-	}
 
 	s := clispinner.New()
 	defer s.Stop()
@@ -73,16 +57,9 @@ func networkChainCreateHandler(cmd *cobra.Command, args []string) error {
 	ev := events.NewBus()
 	go printEvents(ev, s)
 
-	nb, err := newNetworkBuilder(cmd.Context(), networkbuilder.CollectEvents(ev))
+	nb, err := newNetworkBuilder(cmd, networkbuilder.CollectEvents(ev))
 	if err != nil {
 		return err
-	}
-
-	// check if chain already exists on SPN.
-	if _, err := nb.ShowChain(cmd.Context(), chainID); err == nil {
-		s.Stop()
-
-		return fmt.Errorf("chain with id %q already exists", chainID)
 	}
 
 	// initialize the blockchain
@@ -92,15 +69,17 @@ func networkChainCreateHandler(cmd *cobra.Command, args []string) error {
 		sourceOption := networkbuilder.SourceLocal(source)
 		if !xurl.IsLocalPath(source) {
 			switch {
-			case branch != "":
-				sourceOption = networkbuilder.SourceRemoteBranch(source, branch)
 			case tag != "":
 				sourceOption = networkbuilder.SourceRemoteTag(source, tag)
+			case branch != "":
+				sourceOption = networkbuilder.SourceRemoteBranch(source, branch)
+			case hash != "":
+				sourceOption = networkbuilder.SourceRemoteHash(source, hash)
 			default:
 				sourceOption = networkbuilder.SourceRemote(source)
 			}
 		}
-		return nb.Init(cmd.Context(), chainID, sourceOption, initOptions...)
+		return nb.Init(cmd.Context(), sourceOption, initOptions...)
 	}
 
 	// init the chain.
@@ -142,30 +121,6 @@ func networkChainCreateHandler(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer blockchain.Cleanup()
-
-	info, err := blockchain.Info()
-	if err != nil {
-		return err
-	}
-
-	// ask to confirm Genesis if a custom one isn't provided.
-	if genesisURL == "" {
-		prettyGenesis, err := info.Genesis.Pretty()
-		if err != nil {
-			return err
-		}
-
-		fmt.Printf("\nGenesis: \n\n%s\n\n", prettyGenesis)
-
-		prompt := promptui.Prompt{
-			Label:     "Proceed with the Genesis configuration above",
-			IsConfirm: true,
-		}
-		if _, err := prompt.Run(); err != nil {
-			fmt.Println("said no")
-			return nil
-		}
-	}
 
 	s.SetText("Submitting...")
 	s.Start()

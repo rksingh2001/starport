@@ -3,37 +3,24 @@ package networkbuilder
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io/ioutil"
-	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
-	"github.com/dariubs/percent"
-	"github.com/fatih/color"
+	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/pelletier/go-toml"
 	"github.com/tendermint/starport/starport/chainconfig"
-	"github.com/tendermint/starport/starport/pkg/availableport"
 	"github.com/tendermint/starport/starport/pkg/chaincmd"
-	chaincmdrunner "github.com/tendermint/starport/starport/pkg/chaincmd/runner"
-	"github.com/tendermint/starport/starport/pkg/confile"
-	"github.com/tendermint/starport/starport/pkg/ctxticker"
+	"github.com/tendermint/starport/starport/pkg/cosmosaccount"
+	"github.com/tendermint/starport/starport/pkg/cosmosclient"
 	"github.com/tendermint/starport/starport/pkg/events"
-	"github.com/tendermint/starport/starport/pkg/gitpod"
-	"github.com/tendermint/starport/starport/pkg/spn"
-	"github.com/tendermint/starport/starport/pkg/tendermintrpc"
-	"github.com/tendermint/starport/starport/pkg/xchisel"
+	"github.com/tendermint/starport/starport/pkg/jsondoc"
 	"github.com/tendermint/starport/starport/pkg/xfilepath"
-	"github.com/tendermint/starport/starport/services/chain"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
-	tendermintrpcAddr = "http://localhost:26657"
+	spnAddressPrefix = "spn"
 )
 
 var (
@@ -50,8 +37,9 @@ var (
 
 // Builder is network builder.
 type Builder struct {
-	ev        events.Bus
-	spnclient *spn.Client
+	ev      events.Bus
+	cosmos  cosmosclient.Client
+	account cosmosaccount.Account
 }
 
 type Option func(*Builder)
@@ -64,9 +52,10 @@ func CollectEvents(ev events.Bus) Option {
 }
 
 // New creates a Builder.
-func New(spnclient *spn.Client, options ...Option) (*Builder, error) {
+func New(cosmos cosmosclient.Client, account cosmosaccount.Account, options ...Option) (*Builder, error) {
 	b := &Builder{
-		spnclient: spnclient,
+		cosmos:  cosmos,
+		account: account,
 	}
 	for _, opt := range options {
 		opt(b)
@@ -76,7 +65,7 @@ func New(spnclient *spn.Client, options ...Option) (*Builder, error) {
 
 // initOptions holds blockchain initialization options.
 type initOptions struct {
-	isChainIDSource          bool
+	chainID                  string
 	url                      string
 	ref                      plumbing.ReferenceName
 	hash                     string
@@ -88,13 +77,19 @@ type initOptions struct {
 
 // newInitOptions initializes initOptions
 func newInitOptions(chainID string, options ...InitOption) (initOpts initOptions, err error) {
-	initOpts.homePath, err = xfilepath.Join(
-		spnChainHomesDir,
-		xfilepath.Path(chainID),
-	)()
+	var homePath string
+	if chainID != "" {
+		homePath, err = xfilepath.Join(
+			spnChainHomesDir,
+			xfilepath.Path(chainID),
+		)()
+	} else {
+		homePath, err = os.MkdirTemp("", "")
+	}
 	if err != nil {
 		return initOpts, err
 	}
+	initOpts.homePath = homePath
 
 	// set custom options
 	for _, option := range options {
@@ -111,9 +106,9 @@ type SourceOption func(*initOptions)
 type InitOption func(*initOptions)
 
 // SourceChainID makes source determined by the chain's id.
-func SourceChainID() SourceOption {
+func SourceChainID(chainID string) SourceOption {
 	return func(o *initOptions) {
-		o.isChainIDSource = true
+		o.chainID = chainID
 	}
 }
 
@@ -178,13 +173,8 @@ func InitializationKeyringBackend(keyringBackend chaincmd.KeyringBackend) InitOp
 }
 
 // Init initializes blockchain from by source option and init options.
-func (b *Builder) Init(ctx context.Context, chainID string, source SourceOption, options ...InitOption) (*Blockchain, error) {
-	account, err := b.AccountInUse()
-	if err != nil {
-		return nil, err
-	}
-
-	o, err := newInitOptions(chainID, options...)
+func (b *Builder) Init(ctx context.Context, source SourceOption, options ...InitOption) (*Blockchain, error) {
+	o, err := newInitOptions("", options...)
 	if err != nil {
 		return nil, err
 	}
@@ -197,21 +187,6 @@ func (b *Builder) Init(ctx context.Context, chainID string, source SourceOption,
 		path = o.path
 		ref  = o.ref
 	)
-
-	if o.isChainIDSource {
-		chain, err := b.spnclient.ShowChain(ctx, account.Name, chainID)
-		if err != nil {
-			return nil, err
-		}
-
-		// verify chain information
-		if err := b.VerifyChain(ctx, chain); err != nil {
-			return nil, err
-		}
-
-		url = chain.URL
-		hash = chain.Hash
-	}
 
 	// pull the chain.
 	b.ev.Send(events.New(events.StatusOngoing, "Fetching the source code"))
@@ -244,7 +219,7 @@ func (b *Builder) Init(ctx context.Context, chainID string, source SourceOption,
 			return nil, err
 		}
 
-		path = filepath.Join(sourcePath, chainID)
+		path = filepath.Join(sourcePath, o.chainID)
 		if _, err := os.Stat(path); err == nil {
 			// if the directory already exists, we overwrite it to ensure we have the last version
 			if err := os.RemoveAll(path); err != nil {
@@ -301,7 +276,7 @@ func (b *Builder) Init(ctx context.Context, chainID string, source SourceOption,
 	return newBlockchain(
 		ctx,
 		b,
-		chainID,
+		o.chainID,
 		path,
 		url,
 		githash.String(),
@@ -345,267 +320,22 @@ func (b *Builder) ensureRemoteSynced(repo *git.Repository) (url string, err erro
 	return rc.URLs[0], nil
 }
 
-// StartChain downloads the final version version of Genesis on the first start or fails if Genesis
-// has not finalized yet.
-// After overwriting the downloaded Genesis on top of app's home dir, it starts blockchain by
-// executing the start command on its appd binary with optionally provided flags.
-func (b *Builder) StartChain(ctx context.Context, chainID string, flags []string, options ...InitOption) error {
-	o, err := newInitOptions(chainID, options...)
-	if err != nil {
-		return err
-	}
-
-	chainInfo, err := b.ShowChain(ctx, chainID)
-	if err != nil {
-		return err
-	}
-
-	launchInfo, err := b.LaunchInformation(ctx, chainID)
-	if err != nil {
-		return err
-	}
-
-	chainOption := []chain.Option{
-		chain.LogLevel(chain.LogSilent),
-	}
-
-	// Custom home paths
-	if o.homePath != "" {
-		chainOption = append(chainOption, chain.HomePath(o.homePath))
-	}
-
-	// use test keyring backend on Gitpod in order to prevent prompting for keyring
-	// password. This happens because Gitpod uses containers.
-	if gitpod.IsOnGitpod() {
-		chainOption = append(chainOption, chain.KeyringBackend(chaincmd.KeyringBackendTest))
-	}
-
-	sourcePath, err := spnChainSourcePath()
-	if err != nil {
-		return err
-	}
-
-	appPath := filepath.Join(sourcePath, chainID)
-	chainHandler, err := chain.New(appPath, chainOption...)
-	if err != nil {
-		return err
-	}
-
-	commands, err := chainHandler.Commands(ctx)
-	if err != nil {
-		return err
-	}
-
-	if len(launchInfo.GenTxs) == 0 {
-		return errors.New("there are no approved validators yet")
-	}
-
-	// generate the genesis file for the chain to start
-	if err := generateGenesis(ctx, chainInfo, launchInfo, chainHandler); err != nil {
-		return err
-	}
-
-	// prep peer configs.
-	p2pAddresses := launchInfo.Peers
-	chiselAddreses := make(map[string]int) // server addr-local p2p port pair.
-	ports, err := availableport.Find(len(launchInfo.Peers))
-	if err != nil {
-		return err
-	}
-	time.Sleep(time.Second * 2) // make sure that ports are released by the OS before being used.
-
-	if xchisel.IsEnabled() {
-		for i, peer := range launchInfo.Peers {
-			localPort := ports[i]
-			sp := strings.Split(peer, "@")
-			nodeID := sp[0]
-			serverAddr := sp[1]
-
-			p2pAddresses[i] = fmt.Sprintf("%s@127.0.0.1:%d", nodeID, localPort)
-			chiselAddreses[serverAddr] = localPort
-		}
-	}
-
-	// save the finalized version of config.toml with peers.
-	home, err := chainHandler.Home()
-	if err != nil {
-		return err
-	}
-	configTomlPath := filepath.Join(home, "config/config.toml")
-	configToml, err := toml.LoadFile(configTomlPath)
-	if err != nil {
-		return err
-	}
-	configToml.Set("p2p.persistent_peers", strings.Join(p2pAddresses, ","))
-	configToml.Set("p2p.allow_duplicate_ip", true)
-	configTomlFile, err := os.OpenFile(configTomlPath, os.O_RDWR|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	defer configTomlFile.Close()
-	if _, err = configToml.WriteTo(configTomlFile); err != nil {
-		return err
-	}
-
-	g, ctx := errgroup.WithContext(ctx)
-
-	// run the start command of the chain.
-	g.Go(func() error {
-		return commands.
-			Copy(
-				chaincmdrunner.Stdout(os.Stdout),
-				chaincmdrunner.Stderr(os.Stderr)).
-			Start(ctx, flags...)
-	})
-
-	// log connected peers info.
-	g.Go(func() error {
-		tc := tendermintrpc.New(tendermintrpcAddr)
-
-		return ctxticker.DoNow(ctx, time.Second*5, func() error {
-			netInfo, err := tc.GetNetInfo(ctx)
-			if err == nil {
-				count := netInfo.ConnectedPeers + 1 // +1 is itself.
-				color.New(color.FgYellow).Printf("%d (%v%%) PEERS ONLINE\n", count, math.Trunc(percent.PercentOf(count, len(p2pAddresses))))
-			}
-			return nil
-		})
-	})
-
-	if xchisel.IsEnabled() {
-		// start Chisel server.
-		g.Go(func() error {
-			return xchisel.StartServer(ctx, xchisel.DefaultServerPort)
-		})
-
-		// start Chisel clients for all other validators.
-		for serverAddr, localPort := range chiselAddreses {
-			serverAddr, localPort := serverAddr, localPort
-			g.Go(func() error {
-				return xchisel.StartClient(ctx, serverAddr, fmt.Sprintf("%d", localPort), "26656")
-			})
-		}
-	}
-
-	return g.Wait()
+type GenesisAccount struct {
+	Address string
+	Coins   sdktypes.Coins
 }
 
-// GenerateTemporaryGenesis generates the genesis from the launch information in a given temporary directory and return the genesis path
-func (b *Builder) GenerateGenesisWithHome(
-	ctx context.Context,
-	chainID string,
-	launchInfo spn.LaunchInformation,
-	homeDir string,
-) (string, error) {
-	chainInfo, err := b.ShowChain(ctx, chainID)
-	if err != nil {
-		return "", err
-	}
-
-	sourcePath, err := spnChainSourcePath()
-	if err != nil {
-		return "", err
-	}
-
-	appPath := filepath.Join(sourcePath, chainID)
-	chainHandler, err := chain.New(appPath,
-		chain.HomePath(homeDir),
-		chain.LogLevel(chain.LogSilent),
-		chain.KeyringBackend(chaincmd.KeyringBackendTest),
-	)
-	if err != nil {
-		return "", err
-	}
-
-	// Run the commands to generate genesis
-	if err := generateGenesis(ctx, chainInfo, launchInfo, chainHandler); err != nil {
-		return "", err
-	}
-
-	return chainHandler.GenesisPath()
+type LaunchInformation struct {
+	GenesisAccounts []GenesisAccount
+	GenTxs          []jsondoc.Doc
+	Peers           []string
 }
-
-// generateGenesis generate the genesis from the launch information in the specified app home
-func generateGenesis(ctx context.Context, chainInfo spn.Chain, launchInfo spn.LaunchInformation, chainHandler *chain.Chain) error {
-	commands, err := chainHandler.Commands(ctx)
-	if err != nil {
-		return err
-	}
-
-	home, err := chainHandler.Home()
-	if err != nil {
-		return err
-	}
-
-	var initialGenesis []byte
-
-	if chainInfo.GenesisURL != "" {
-		var hash string
-		if initialGenesis, hash, err = genesisAndHashFromURL(ctx, chainInfo.GenesisURL); err != nil {
-			return err
-		}
-		if hash != chainInfo.GenesisHash {
-			return errors.New("hash mismatch for the downloaded genesis")
-		}
-	} else if initialGenesis, err = ioutil.ReadFile(initialGenesisPath(home)); err != nil {
-		return err
-	}
-
-	// overwrite genesis with initial genesis.
-	if err := ioutil.WriteFile(genesisPath(home), initialGenesis, 0755); err != nil {
-		return err
-	}
-
-	// make sure that Genesis' genesis_time is set to chain's creation time on SPN.
-	cf := confile.New(confile.DefaultJSONEncodingCreator, genesisPath(home))
-	var genesis map[string]interface{}
-	if err := cf.Load(&genesis); err != nil {
-		return err
-	}
-	genesis["genesis_time"] = chainInfo.CreatedAt.UTC().Format(time.RFC3339)
-	if err := cf.Save(genesis); err != nil {
-		return err
-	}
-
-	// add the genesis accounts
-	for _, account := range launchInfo.GenesisAccounts {
-		genesisAccount := chain.Account{
-			Address: account.Address,
-			Coins:   account.Coins.String(),
-		}
-
-		if err := commands.AddGenesisAccount(ctx, genesisAccount.Address, genesisAccount.Coins); err != nil {
-			return err
-		}
-	}
-
-	// reset gentx directory
-	os.Mkdir(filepath.Join(home, "config/gentx"), os.ModePerm)
-	dir, err := ioutil.ReadDir(filepath.Join(home, "config/gentx"))
-	if err != nil {
-		return err
-	}
-
-	// remove all the current gentxs
-	for _, d := range dir {
-		if err := os.RemoveAll(filepath.Join(home, "config/gentx", d.Name())); err != nil {
-			return err
-		}
-	}
-
-	// add and collect the gentxs
-	for i, gentx := range launchInfo.GenTxs {
-		// Save the gentx in the gentx directory
-		gentxPath := filepath.Join(home, fmt.Sprintf("config/gentx/gentx%v.json", i))
-		if err = ioutil.WriteFile(gentxPath, gentx, 0666); err != nil {
-			return err
-		}
-	}
-	if len(launchInfo.GenTxs) > 0 {
-		if err = commands.CollectGentxs(ctx); err != nil {
-			return err
-		}
-	}
-
-	return nil
+type Chain struct {
+	ChainID     string
+	Creator     string
+	URL         string
+	Hash        string
+	GenesisURL  string
+	GenesisHash string
+	CreatedAt   time.Time
 }

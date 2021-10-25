@@ -106,7 +106,7 @@ func flagSetHome() *flag.FlagSet {
 	return fs
 }
 
-func getHomeFlag(cmd *cobra.Command) (home string) {
+func getHome(cmd *cobra.Command) (home string) {
 	home, _ = cmd.Flags().GetString(flagHome)
 	return
 }
@@ -130,7 +130,7 @@ func flagGetProto3rdParty(cmd *cobra.Command) bool {
 
 func newChainWithHomeFlags(cmd *cobra.Command, chainOption ...chain.Option) (*chain.Chain, error) {
 	// Check if custom home is provided
-	if home := getHomeFlag(cmd); home != "" {
+	if home := getHome(cmd); home != "" {
 		chainOption = append(chainOption, chain.HomePath(home))
 	}
 
@@ -145,7 +145,7 @@ func newChainWithHomeFlags(cmd *cobra.Command, chainOption ...chain.Option) (*ch
 
 func initOptionWithHomeFlag(cmd *cobra.Command, initOptions []networkbuilder.InitOption) []networkbuilder.InitOption {
 	// Check if custom home is provided
-	if home := getHomeFlag(cmd); home != "" {
+	if home := getHome(cmd); home != "" {
 		initOptions = append(initOptions, networkbuilder.InitializationHomePath(home))
 	}
 
